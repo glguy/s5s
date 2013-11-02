@@ -14,6 +14,11 @@ import System.IO.Error
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString as B
 
+------------------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------------------
+
+
 data Configuration = Configuration
   { listenHost    :: HostName
   , listenService :: ServiceName
@@ -28,15 +33,28 @@ getConfiguration = do
   logMutex <- newMVar ()
   return (Configuration "::" "2080" VDebug logMutex)
 
+------------------------------------------------------------------------
+-- Logging
+------------------------------------------------------------------------
+
+logMsg :: Verbosity -> Configuration -> String -> IO ()
 logMsg level config msg
   = when (level <= debugLevel config)
   $ do threadId <- myThreadId
        let msg' = drop 9 (show threadId) ++ ": " ++ msg
        withMVar (logLock config) (const (hPutStrLn stderr msg'))
 
+info :: Configuration -> String -> IO ()
 info = logMsg VInfo
+
+debug :: Configuration -> String -> IO ()
 debug = logMsg VDebug
 
+------------------------------------------------------------------------
+-- Main
+------------------------------------------------------------------------
+
+main :: IO ()
 main = do
 
   config <- getConfiguration
@@ -53,19 +71,27 @@ main = do
     forkIO (listenerLoop config ai `finally` putMVar done ())
   takeMVar done
 
+------------------------------------------------------------------------
+-- Top-level listener
+------------------------------------------------------------------------
 
+listenerLoop :: Configuration -> AddrInfo -> IO ()
 listenerLoop config ai =
   bracket (socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)) sClose $ \s ->
   do setSocketOption s ReuseAddr 1
      bind s (addrAddress ai)
-     listen s 5
+     listen s maxListenQueue
      forever $ do
        (c,who) <- accept s
        info config ("Connection accepted from " ++ show who)
        forkIO (handleClientHello config c who `finally` sClose c)
 
 
+------------------------------------------------------------------------
+-- Client startup
+------------------------------------------------------------------------
 
+handleClientHello :: Configuration -> Socket -> SockAddr -> IO ()
 handleClientHello config s who = do
   debug config ("Client thread started for " ++ show who)
   SocksHello authTypes <- waitSerialized s
@@ -80,8 +106,12 @@ handleClientHello config s who = do
     else do debug config "No acceptable authentication methods proposed"
             sendSerialized s (SocksHelloResponse SocksMethodNotAcceptable)
 
+------------------------------------------------------------------------
+-- Post authentication
+------------------------------------------------------------------------
 
 
+readyForClientRequest :: Configuration -> Socket -> SockAddr -> IO ()
 readyForClientRequest config s who = do
   SocksRequest cmd dst <- waitSerialized s
   debug config ("Requesting " ++ show cmd ++ " @ " ++ show dst)
@@ -96,14 +126,16 @@ readyForClientRequest config s who = do
 -- Request modes
 ------------------------------------------------------------------------
 
-handleClientRequest SocksCommandConnect config s who dstAddr =
-  bracket (socket (sockAddrFamily dstAddr) Stream defaultProtocol)
+handleClientRequest :: SocksCommand -> Configuration -> Socket -> SockAddr -> SockAddr -> IO ()
+
+handleClientRequest SocksCommandConnect config s who dst =
+  bracket (socket (sockAddrFamily dst) Stream defaultProtocol)
           (\s -> do sClose s
                     info config "Thread complete")
           $ \c -> do
 
-  info config ("Connecting to " ++ show dstAddr)
-  connectResult <- tryIOError (connect c dstAddr)
+  debug config ("Connecting to " ++ show dst)
+  connectResult <- tryIOError (connect c dst)
 
   case connectResult of
 
@@ -112,7 +144,7 @@ handleClientRequest SocksCommandConnect config s who dstAddr =
       sendSerialized s (errorResponse SocksErrorConnectionRefused)
 
     Right () -> do
-      info config ("Connected to " ++ show dstAddr)
+      info config ("Connected to " ++ show dst)
       localAddr <- sockAddrToSocksAddress `fmap` getSocketName c
       sendSerialized s (SocksResponse SocksReplySuccess localAddr)
       tcpRelay config s c
@@ -127,6 +159,7 @@ handleClientRequest cmd config s who _ = do
 -- TCP Proxy
 ------------------------------------------------------------------------
 
+tcpRelay :: Configuration -> Socket -> Socket -> IO ()
 tcpRelay config s c = do
   done <- newEmptyMVar
   t1 <- forkIO $ shuttle s c `finally` putMVar done ()
@@ -135,14 +168,14 @@ tcpRelay config s c = do
   killThread t1
   killThread t2
 
+shuttle :: Socket -> Socket -> IO ()
 shuttle source sink = do
   bs <- recv source 4096
   unless (B.null bs) (sendAll sink bs >> shuttle source sink)
 
 
-
 ------------------------------------------------------------------------
--- 
+-- Address utilities
 ------------------------------------------------------------------------
 
 sockAddrToSocksAddress :: SockAddr -> SocksAddress
@@ -154,6 +187,7 @@ sockAddrFamily SockAddrInet  {} = AF_INET
 sockAddrFamily SockAddrInet6 {} = AF_INET6
 sockAddrFamily SockAddrUnix  {} = AF_UNIX
 
+errorResponse :: SocksError -> SocksResponse
 errorResponse err = (SocksResponse (SocksReplyError err) (SocksAddress (SocksAddrIPV4 iNADDR_ANY) aNY_PORT))
 
 resolveSocksAddress :: Configuration -> SocksAddress -> IO (Maybe SockAddr)
@@ -173,6 +207,7 @@ resolveSocksAddress config (SocksAddress host port) =
         []     -> do info config ("Unable to resolve " ++ B8.unpack str)
                      return Nothing
 
+tcpHints :: AddrInfo
 tcpHints = defaultHints
          { addrSocketType = Stream
          , addrFlags      = [AI_ADDRCONFIG]
