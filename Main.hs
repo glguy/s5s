@@ -64,7 +64,7 @@ debug = logMsg VDebug
 ------------------------------------------------------------------------
 
 main :: IO ()
-main = do
+main = withSocketsDo $ do
 
   config <- getConfiguration
 
@@ -72,8 +72,6 @@ main = do
   ais <- getAddrInfo (Just hints) (Just (listenHost config)) (Just (listenService config))
 
   when (null ais) (fail "Failed to resolve listening address")
-  for_ ais $ \ai ->
-    info config ("Listening on " ++ show (addrAddress ai))
 
   done <- newEmptyMVar
   for_ ais $ \ai ->
@@ -94,6 +92,7 @@ listenerLoop config ai =
   when (addrFamily ai == AF_INET6) (setSocketOption s IPv6Only 1)
 
   bind s (addrAddress ai)
+  info config ("Listening on " ++ show (addrAddress ai))
   listen s maxListenQueue
 
   forever $ do
@@ -209,12 +208,11 @@ handleClientRequest SocksCommandUdpAssociate config s who dst =
   withUdpSocket (sockAddrFamily localAddr) $ \c2 ->
   do
   debug config "Associating UDP socket"
-  debug config ("UDP destination " ++ show dst)
+  debug config ("Client UDP address: " ++ show dst)
 
-  info config ("Trying to bind " ++ show (setPort 0 localAddr))
   bind c1 (setPort 0 localAddr)
   localDataAddr <- getSocketName c1
-  info config ("UDP incoming socket bound to " ++ show localDataAddr)
+  debug config ("Server UDP address: " ++ show localDataAddr)
 
   bind c2 (wildAddress (sockAddrFamily localAddr))
   remoteDataAddr <- getSocketName c2
@@ -222,21 +220,7 @@ handleClientRequest SocksCommandUdpAssociate config s who dst =
 
   sendSerialized s (SocksResponse SocksReplySuccess (sockAddrToSocksAddress localDataAddr))
 
-  -- XXX: Need to support the case where 'dst' is 0:0
-
-  _forwardThread  <- forkIO $ forever $ do
-                       (bs,src) <- recvFrom c1 4096
-                       case (src == dst, decode bs) of
-                         (True, Right udp) | udpFragment udp == 0 -> do
-                           debug config ("Got packet from client to " ++ show (udpRemoteAddr udp))
-                           mbAddr <- resolveSocksAddress config (udpRemoteAddr udp)
-                           for_ mbAddr (sendTo c2 (udpContents udp))
-                         _ -> debug config "Ignoring UDP packet"
-
-  _backwardThread <- forkIO $ forever $ do
-                       (msg, remote) <- recvFrom c2 4096
-                       debug config ("Got packet from remote " ++ show remote)
-                       sendTo c1 (encode (SocksUdpEnvelope 0 (sockAddrToSocksAddress remote) msg)) dst
+  udpRelay config c1 c2 dst
 
   -- UDP connections are preserved until the control connection goes down
   setSocketOption s KeepAlive 1
@@ -247,6 +231,68 @@ handleClientRequest SocksCommandUdpAssociate config s who dst =
 handleClientRequest cmd config s who _ = do
   info config ("Unsupported command " ++ show cmd)
   sendSerialized s (errorResponse SocksErrorCommandNotSupported)
+
+isWild (SockAddrInet  p   h  ) = p == aNY_PORT || h == iNADDR_ANY
+isWild (SockAddrInet6 p _ h _) = p == aNY_PORT || h == iN6ADDR_ANY
+isWild (SockAddrUnix  _      ) = error "isWild: SockAddrUnix not supported"
+
+discardIOErrors m = catchIOError m (const (return ()))
+
+udpRelay config c1 c2 dst | isWild dst = do debug config "UDP address learning mode"
+                                            forkIO (discardIOErrors handleFirst)
+                                            return ()
+  where
+  handleFirst = do
+
+    (bs,src) <- recvFrom c1 4096
+    debug config ("-> client " ++ show src ++ " (" ++ show (B.length bs) ++ ")")
+
+    case decode bs of
+
+      Right udp | udpFragment udp == 0 -> do
+        mbAddr <- resolveSocksAddress config (udpRemoteAddr udp)
+        case mbAddr of
+          Nothing   -> do debug config ("Dropping unresolvable packet: " ++ show (udpRemoteAddr udp))
+          Just addr -> do let cnts = udpContents udp
+                          debug config ("<- remote " ++ show addr ++ " (" ++ show (B.length cnts) ++ ")")
+                          sendTo c2 cnts addr
+                          return ()
+        udpRelay config c1 c2 src
+
+      Left err -> do debug config ("Ignoring malformed UDP packet: " ++ err)
+                     handleFirst
+
+
+udpRelay config c1 c2 dst = do
+
+  _forwardThread  <- forkIO $ discardIOErrors $ forever $ do
+
+    (bs,src) <- recvFrom c1 4096
+    debug config ("-> client " ++ show src ++ " (" ++ show (B.length bs) ++ ")")
+
+    case (src == dst, decode bs) of
+      (False,_)    -> debug config "Ignoring UDP packet due to source mismatch"
+      (_,Left err) -> debug config ("Ignoring malformed UDP packet: " ++ err)
+      (_,Right udp) | udpFragment udp /= 0 -> debug config ("Ignoring fragmented UDP packet: " ++ show (udpFragment udp))
+
+      (True, Right udp) -> do
+        mbAddr <- resolveSocksAddress config (udpRemoteAddr udp)
+        case mbAddr of
+          Nothing   -> do debug config ("Dropping unresolvable packet: " ++ show (udpRemoteAddr udp))
+          Just addr -> do let cnts = udpContents udp
+                          debug config ("<- remote " ++ show addr ++ " (" ++ show (B.length cnts) ++ ")")
+                          sendTo c2 cnts addr
+                          return ()
+
+
+  _backwardThread <- forkIO $ discardIOErrors $ forever $ do
+    (msg, remote) <- recvFrom c2 4096
+    debug config ("-> remote " ++ show remote ++ " (" ++ show (B.length msg) ++ ")")
+    let cnts = encode (SocksUdpEnvelope 0 (sockAddrToSocksAddress remote) msg)
+    debug config ("<- client " ++ show dst ++ " (" ++ show (B.length cnts) ++ ")")
+    sendTo c1 cnts dst
+
+  return ()
 
 
 ------------------------------------------------------------------------
@@ -295,10 +341,10 @@ resolveSocksAddress config (SocksAddress host port) =
       case ais of
 
         ai : _ -> do let addr = addrAddress ai
-                     info config ("Resolved " ++ hostname ++ " to " ++ show addr)
+                     debug config ("Resolved " ++ hostname ++ " to " ++ show addr)
                      return (Just addr)
 
-        []     -> do info config ("Unable to resolve " ++ B8.unpack str)
+        []     -> do debug config ("Unable to resolve " ++ B8.unpack str)
                      return Nothing
 
 tcpHints :: AddrInfo
