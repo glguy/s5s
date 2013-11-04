@@ -32,6 +32,7 @@ data Configuration = Configuration
   , configPass    :: ByteString
   , authPreference :: [SocksMethod]
   , bindAddress   :: SockAddr
+  , forceLearningMode :: Bool
   }
 
 data Verbosity = VInfo | VDebug
@@ -40,7 +41,7 @@ data Verbosity = VInfo | VDebug
 getConfiguration = do
   logMutex <- newMVar ()
   return (Configuration "" "2080" VDebug logMutex "emertens" "paswerd" [SocksMethodUsernamePassword,SocksMethodNone]
-                        (SockAddrInet aNY_PORT iNADDR_ANY))
+                        (SockAddrInet aNY_PORT iNADDR_ANY) True)
 
 ------------------------------------------------------------------------
 -- Logging
@@ -220,7 +221,8 @@ handleClientRequest SocksCommandUdpAssociate config s who dst =
 
   sendSerialized s (SocksResponse SocksReplySuccess (sockAddrToSocksAddress localDataAddr))
 
-  udpRelay config c1 c2 dst
+  let relay = if forceLearningMode config || isWild dst then learningUdpRelay else udpRelay
+  relay config c1 c2 dst
 
   -- UDP connections are preserved until the control connection goes down
   setSocketOption s KeepAlive 1
@@ -238,9 +240,11 @@ isWild (SockAddrUnix  _      ) = error "isWild: SockAddrUnix not supported"
 
 discardIOErrors m = catchIOError m (const (return ()))
 
-udpRelay config c1 c2 dst | isWild dst = do debug config "UDP address learning mode"
-                                            forkIO (discardIOErrors handleFirst)
-                                            return ()
+learningUdpRelay :: Configuration -> Socket -> Socket -> SockAddr -> IO ()
+learningUdpRelay config c1 c2 dst =
+  do debug config "UDP address learning mode"
+     forkIO (discardIOErrors handleFirst)
+     return ()
   where
   handleFirst = do
 
@@ -263,6 +267,7 @@ udpRelay config c1 c2 dst | isWild dst = do debug config "UDP address learning m
                      handleFirst
 
 
+udpRelay :: Configuration -> Socket -> Socket -> SockAddr -> IO ()
 udpRelay config c1 c2 dst = do
 
   _forwardThread  <- forkIO $ discardIOErrors $ forever $ do
@@ -302,16 +307,26 @@ udpRelay config c1 c2 dst = do
 tcpRelay :: Configuration -> Socket -> Socket -> IO ()
 tcpRelay config s c = do
   done <- newEmptyMVar
-  t1 <- forkIO $ shuttle s c `finally` putMVar done ()
-  t2 <- forkIO $ shuttle c s `finally` putMVar done ()
+  t1 <- forkIO $ shuttle config s c `finally` putMVar done ()
+  t2 <- forkIO $ shuttle config c s `finally` putMVar done ()
   takeMVar done
   killThread t1
   killThread t2
 
-shuttle :: Socket -> Socket -> IO ()
-shuttle source sink = do
+shuttle :: Configuration -> Socket -> Socket -> IO ()
+shuttle config source sink = do
+  sourcePeer <- getPeerName source
+  sourceName <- getSocketName source
+  sinkName   <- getSocketName sink
+  sinkPeer   <- getPeerName sink
   bs <- recv source 4096
-  unless (B.null bs) (sendAll sink bs >> shuttle source sink)
+  unless (B.null bs) $ do
+    sendAll sink bs
+    debug config (show sourcePeer ++ " -> " ++ show sourceName
+               ++ " : "
+               ++ show sinkName   ++ " -> " ++ show sinkPeer
+               ++ " (" ++ show (B.length bs) ++ ")")
+    shuttle config source sink
 
 
 ------------------------------------------------------------------------
