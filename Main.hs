@@ -86,19 +86,20 @@ main = do
 
 listenerLoop :: Configuration -> AddrInfo -> IO ()
 listenerLoop config ai =
-  bracket (socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)) sClose $ \s ->
-  do setSocketOption s ReuseAddr 1
+  withTcpSocket (addrFamily ai) $ \s -> do
+  setSocketOption s ReuseAddr 1
 
-     -- We support binding on multiple addresses. Keeping them separate
-     -- will help later when we're making additional connections for UDP.
-     when (addrFamily ai == AF_INET6) (setSocketOption s IPv6Only 1)
+  -- We support binding on multiple addresses. Keeping them separate
+  -- will help later when we're making additional connections for UDP.
+  when (addrFamily ai == AF_INET6) (setSocketOption s IPv6Only 1)
 
-     bind s (addrAddress ai)
-     listen s maxListenQueue
-     forever $ do
-       (c,who) <- accept s
-       info config ("Connection accepted from " ++ show who)
-       forkIO (handleClientHello config c who `finally` sClose c)
+  bind s (addrAddress ai)
+  listen s maxListenQueue
+
+  forever $ do
+    (c,who) <- accept s
+    info config ("Connection accepted from " ++ show who)
+    forkIO (handleClientHello config c who `finally` sClose c)
 
 
 ------------------------------------------------------------------------
@@ -162,11 +163,9 @@ handleClientRequest :: SocksCommand -> Configuration -> Socket -> SockAddr -> So
 
 
 handleClientRequest SocksCommandConnect config s who dst =
-  bracket (socket (sockAddrFamily dst) Stream defaultProtocol)
-          (\s -> do sClose s
-                    info config "Thread complete")
-          $ \c -> do
-
+  flip finally (debug config "Thread complete") $
+  withTcpSocket (sockAddrFamily dst) $ \c ->
+  do
   debug config ("Connecting to " ++ show dst)
   connectResult <- tryIOError (connect c dst)
 
@@ -184,9 +183,9 @@ handleClientRequest SocksCommandConnect config s who dst =
 
 
 
-handleClientRequest SocksCommandBind config s who dst
-  = flip finally (info config "Thread Complete")
-  $ bracket (socket (sockAddrFamily dst) Stream defaultProtocol) sClose $ \c ->
+handleClientRequest SocksCommandBind config s who dst =
+  flip finally (info config "Thread Complete") $
+  withTcpSocket (sockAddrFamily dst) $ \c ->
   do
   debug config "Binding TCP socket"
 
@@ -206,10 +205,9 @@ handleClientRequest SocksCommandBind config s who dst
 handleClientRequest SocksCommandUdpAssociate config s who dst =
   flip finally (info config "Thread Complete") $
   getSocketName s >>= \localAddr ->
-  bracket (socket (sockAddrFamily localAddr) Datagram defaultProtocol) sClose $ \c1 ->
-  bracket (socket (sockAddrFamily localAddr) Datagram defaultProtocol) sClose $ \c2 ->
+  withUdpSocket (sockAddrFamily localAddr) $ \c1 ->
+  withUdpSocket (sockAddrFamily localAddr) $ \c2 ->
   do
-
   debug config "Associating UDP socket"
   debug config ("UDP destination " ++ show dst)
 
@@ -322,3 +320,9 @@ getPort SockAddrUnix {}            = error "seriously, stop using unix sockets"
 wildAddress :: Family -> SockAddr
 wildAddress AF_INET  = SockAddrInet aNY_PORT iNADDR_ANY
 wildAddress AF_INET6 = SockAddrInet6 aNY_PORT 0 iN6ADDR_ANY 0
+
+withTcpSocket :: Family -> (Socket -> IO a) -> IO a
+withTcpSocket family = bracket (socket family Stream defaultProtocol) sClose
+
+withUdpSocket :: Family -> (Socket -> IO a) -> IO a
+withUdpSocket family = bracket (socket family Datagram defaultProtocol) sClose
