@@ -276,14 +276,14 @@ udpRelay config c1 c2 dst = do
     debug config ("-> client " ++ show src ++ " (" ++ show (B.length bs) ++ ")")
 
     case (src == dst, decode bs) of
-      (False,_)    -> debug config "Ignoring UDP packet due to source mismatch"
-      (_,Left err) -> debug config ("Ignoring malformed UDP packet: " ++ err)
-      (_,Right udp) | udpFragment udp /= 0 -> debug config ("Ignoring fragmented UDP packet: " ++ show (udpFragment udp))
+      (False,_)    -> debug config "Dropping UDP packet due to source mismatch"
+      (_,Left err) -> debug config ("Dropping malformed UDP packet: " ++ err)
+      (_,Right udp) | udpFragment udp /= 0 -> debug config ("Dropping fragmented UDP packet: " ++ show (udpFragment udp))
 
       (True, Right udp) -> do
         mbAddr <- resolveSocksAddress config (udpRemoteAddr udp)
         case mbAddr of
-          Nothing   -> do debug config ("Dropping unresolvable packet: " ++ show (udpRemoteAddr udp))
+          Nothing   -> do debug config "Dropping unresolvable packet"
           Just addr -> do let cnts = udpContents udp
                           debug config ("<- remote " ++ show addr ++ " (" ++ show (B.length cnts) ++ ")")
                           sendTo c2 cnts addr
@@ -336,6 +336,7 @@ shuttle config source sink = do
 sockAddrToSocksAddress :: SockAddr -> SocksAddress
 sockAddrToSocksAddress (SockAddrInet  p   h  ) = SocksAddress (SocksAddrIPV4 h) p
 sockAddrToSocksAddress (SockAddrInet6 p _ h _) = SocksAddress (SocksAddrIPV6 h) p
+sockAddrToSocksAddress (SockAddrUnix _       ) = error "sockAddrToSocksAddress: Unix sockets not supported"
 
 sockAddrFamily :: SockAddr -> Family
 sockAddrFamily SockAddrInet  {} = AF_INET
