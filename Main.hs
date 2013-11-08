@@ -307,26 +307,30 @@ udpRelay config c1 c2 dst = do
 tcpRelay :: Configuration -> Socket -> Socket -> IO ()
 tcpRelay config s c = do
   done <- newEmptyMVar
-  t1 <- forkIO $ shuttle config s c `finally` putMVar done ()
-  t2 <- forkIO $ shuttle config c s `finally` putMVar done ()
+  t1 <- forkIO (shuttle config s c `finally` putMVar done ())
+  t2 <- forkIO (shuttle config c s `finally` putMVar done ())
   takeMVar done
-  killThread t1
-  killThread t2
+  takeMVar done
 
 shuttle :: Configuration -> Socket -> Socket -> IO ()
-shuttle config source sink = do
-  sourcePeer <- getPeerName source
-  sourceName <- getSocketName source
-  sinkName   <- getSocketName sink
-  sinkPeer   <- getPeerName sink
-  bs <- recv source 4096
-  unless (B.null bs) $ do
-    sendAll sink bs
-    debug config (show sourcePeer ++ " -> " ++ show sourceName
-               ++ " : "
-               ++ show sinkName   ++ " -> " ++ show sinkPeer
-               ++ " (" ++ show (B.length bs) ++ ")")
-    shuttle config source sink
+shuttle config source sink = loop `finally` cleanup
+  where
+  cleanup = do _ <- tryIOError (shutdown source ShutdownReceive)
+               _ <- tryIOError (shutdown sink   ShutdownSend)
+               return ()
+  loop = do
+    sourcePeer <- getPeerName source
+    sourceName <- getSocketName source
+    sinkName   <- getSocketName sink
+    sinkPeer   <- getPeerName sink
+    bs <- recv source 4096
+    unless (B.null bs) $ do
+      sendAll sink bs
+      debug config (show sourcePeer ++ " -> " ++ show sourceName
+                 ++ " : "
+                 ++ show sinkName   ++ " -> " ++ show sinkPeer
+                 ++ " (" ++ show (B.length bs) ++ ")")
+      loop
 
 
 ------------------------------------------------------------------------
