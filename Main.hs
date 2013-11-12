@@ -17,6 +17,7 @@ import System.IO.Error
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString as B
 import Data.ByteString (ByteString)
+import BinaryHandle
 
 ------------------------------------------------------------------------
 -- Configuration
@@ -98,18 +99,19 @@ listenerLoop config ai =
 
   forever $ do
     (c,who) <- accept s
+    cxt     <- newGetContext
     info config ("Connection accepted from " ++ show who)
-    forkIO (handleClientHello config c who `finally` sClose c)
+    forkIO (handleClientHello config c cxt who `finally` sClose c)
 
 
 ------------------------------------------------------------------------
 -- Client startup
 ------------------------------------------------------------------------
 
-handleClientHello :: Configuration -> Socket -> SockAddr -> IO ()
-handleClientHello config s who = do
+handleClientHello :: Configuration -> Socket -> GetContext -> SockAddr -> IO ()
+handleClientHello config s cxt who = do
   debug config ("Client thread started for " ++ show who)
-  SocksHello authTypes <- waitSerialized s
+  SocksHello authTypes <- recvGet s cxt
 
   debug config ("Client proposed " ++ show authTypes)
   debug config ("Server supports " ++ show (authPreference config))
@@ -119,19 +121,19 @@ handleClientHello config s who = do
     Just SocksMethodNone ->
          do debug config "No authentication selected"
             sendSerialized s (SocksHelloResponse SocksMethodNone)
-            readyForClientRequest config s who
+            readyForClientRequest config s cxt who
 
     Just SocksMethodUsernamePassword ->
          do debug config "Username/password authentication selected"
             sendSerialized s (SocksHelloResponse SocksMethodUsernamePassword)
-            login <- waitSerialized s
+            login <- recvGet s cxt
 
             if configUser config == plainUsername login &&
                configPass config == plainPassword login
 
               then do debug config "Authentication succeeded"
                       sendSerialized s SocksPlainLoginSuccess
-                      readyForClientRequest config s who
+                      readyForClientRequest config s cxt who
 
               else do debug config "Authentication failed"
                       sendSerialized s SocksPlainLoginFailure
@@ -144,9 +146,9 @@ handleClientHello config s who = do
 ------------------------------------------------------------------------
 
 
-readyForClientRequest :: Configuration -> Socket -> SockAddr -> IO ()
-readyForClientRequest config s who = do
-  req <- waitSerialized s
+readyForClientRequest :: Configuration -> Socket -> GetContext -> SockAddr -> IO ()
+readyForClientRequest config s cxt who = do
+  req <- recvGet s cxt
   mbDst <- resolveSocksAddress config (requestDst req)
   case mbDst of
 
@@ -323,7 +325,7 @@ shuttle config source sink = loop `finally` cleanup
     sourceName <- getSocketName source
     sinkName   <- getSocketName sink
     sinkPeer   <- getPeerName sink
-    bs <- recv source 4096
+    bs <- recv source (8*4096)
     unless (B.null bs) $ do
       sendAll sink bs
       debug config (show sourcePeer ++ " -> " ++ show sourceName
